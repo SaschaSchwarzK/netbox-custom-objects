@@ -35,6 +35,7 @@ from extras.choices import (
     CustomFieldUIEditableChoices,
     CustomFieldUIVisibleChoices,
 )
+from extras.data import CHOICE_SETS
 from extras.models import ConfigContext, ConfigContextModel, CustomField, CustomFieldChoiceSet
 from extras.models.customfields import SEARCH_TYPES
 from extras.utils import is_taggable, run_validators
@@ -917,10 +918,10 @@ class DynamicAssignment(ChangeLoggedModel):
             while tg is not None:
                 tenant_group_ids.append(tg.pk)
                 tg = tg.parent
-            qs = qs.filter(
-                Q(tenants__isnull=True) | Q(tenants=tenant)
-            ).filter(
-                Q(tenant_groups__isnull=True) | Q(tenant_groups__in=tenant_group_ids) if tenant_group_ids else Q(tenant_groups__isnull=True)
+            qs = qs.filter(Q(tenants__isnull=True) | Q(tenants=tenant)).filter(
+                Q(tenant_groups__isnull=True) | Q(tenant_groups__in=tenant_group_ids)
+                if tenant_group_ids
+                else Q(tenant_groups__isnull=True)
             )
         else:
             qs = qs.filter(tenants__isnull=True, tenant_groups__isnull=True)
@@ -930,12 +931,18 @@ class DynamicAssignment(ChangeLoggedModel):
         if cluster is not None:
             cluster_type_ids = [cluster.type_id] if cluster.type_id else []
             cluster_group_ids = [cluster.group_id] if cluster.group_id else []
-            qs = qs.filter(
-                Q(clusters__isnull=True) | Q(clusters=cluster)
-            ).filter(
-                Q(cluster_types__isnull=True) | Q(cluster_types__in=cluster_type_ids) if cluster_type_ids else Q(cluster_types__isnull=True)
-            ).filter(
-                Q(cluster_groups__isnull=True) | Q(cluster_groups__in=cluster_group_ids) if cluster_group_ids else Q(cluster_groups__isnull=True)
+            qs = (
+                qs.filter(Q(clusters__isnull=True) | Q(clusters=cluster))
+                .filter(
+                    Q(cluster_types__isnull=True) | Q(cluster_types__in=cluster_type_ids)
+                    if cluster_type_ids
+                    else Q(cluster_types__isnull=True)
+                )
+                .filter(
+                    Q(cluster_groups__isnull=True) | Q(cluster_groups__in=cluster_group_ids)
+                    if cluster_group_ids
+                    else Q(cluster_groups__isnull=True)
+                )
             )
         else:
             qs = qs.filter(clusters__isnull=True, cluster_types__isnull=True, cluster_groups__isnull=True)
@@ -1408,36 +1415,38 @@ class CustomObjectConfigContextMixin(ConfigContextModel):
     class Meta:
         abstract = True
 
-    def _config_context_source(self):
+    def _config_context_dimension_fields(self):
+        """Return this type's convention fields that feed a config context dimension."""
+        return config_context_dimension_fields(
+            self.custom_object_type.fields.filter(
+                type=CustomFieldTypeChoices.TYPE_OBJECT,
+                is_polymorphic=False,
+                name__in=CONFIG_CONTEXT_DIMENSION_FIELDS.keys(),
+            ).select_related("related_object_type")
+        )
+
+    def _config_context_source(self, dimension_fields=None):
         """Proxy populated from convention-named OBJECT fields, or None if none match.
 
         Only honours a field whose *name* and *target model* both match the
         convention, so a mistyped/mispointed field is silently ignored rather
-        than feeding the wrong dimension.
+        than feeding the wrong dimension.  *dimension_fields* lets a caller that
+        renders many objects of one type look the fields up once.
         """
         from types import SimpleNamespace
 
-        cot = self.custom_object_type
-        by_name = {
-            f.name: f
-            for f in cot.fields.filter(
-                type=CustomFieldTypeChoices.TYPE_OBJECT,
-                is_polymorphic=False,
-                name__in=CONFIG_CONTEXT_DIMENSION_FIELDS.keys(),
-            )
-        }
-        dims = {name: None for name in CONFIG_CONTEXT_DIMENSION_FIELDS}
-        used = False
-        for name, (app_label, model_name) in CONFIG_CONTEXT_DIMENSION_FIELDS.items():
-            f = by_name.get(name)
-            ct = getattr(f, "related_object_type", None)
-            if f and ct and (ct.app_label, ct.model) == (app_label, model_name):
-                dims[name] = getattr(self, name, None)
-                used = True
-        if not used:
+        if dimension_fields is None:
+            dimension_fields = self._config_context_dimension_fields()
+        if not dimension_fields:
             return None
+        dims = {name: None for name in CONFIG_CONTEXT_DIMENSION_FIELDS}
+        for name in dimension_fields:
+            dims[name] = getattr(self, name, None)
         proxy = SimpleNamespace(**dims)
-        proxy.tags = self.tags  # custom objects are taggable
+        # get_for_object() only calls tags.slugs(); read them via all() so prefetched
+        # tags don't cost a query.
+        tag_slugs = sorted(tag.slug for tag in self.tags.all())
+        proxy.tags = SimpleNamespace(slugs=lambda: tag_slugs)
         return proxy
 
     def get_config_context(self):
@@ -1445,21 +1454,79 @@ class CustomObjectConfigContextMixin(ConfigContextModel):
         overlay ``local_context_data`` (which takes precedence)."""
         return self._render_config_context(self._config_context_source())
 
-    def _render_config_context(self, source):
+    def _render_config_context(self, source, source_data=None):
         """Merge the ConfigContexts for *source* (a proxy from
         ``_config_context_source()``, or ``None``), then overlay
         ``local_context_data``.  Takes a pre-built *source* so a caller that also
         needs the source-context list (the detail tab) can build the proxy once
-        instead of paying for the ``cot.fields`` lookup twice.
+        instead of paying for the ``cot.fields`` lookup twice.  *source_data*, if
+        given, is the already-merged source context data to use instead.
         """
-        data = {}
-        if source is not None:
-            contexts = ConfigContext.objects.get_for_object(source, aggregate_data=True) or []
-            for context in contexts:
-                data = deepmerge(data, context)
+        if source_data is None:
+            source_data = _merged_source_context_data(source)
+        # Copy: source_data may be shared with other objects (see ConfigContextRenderer).
+        data = dict(source_data)
         if self.local_context_data:
             data = deepmerge(data, self.local_context_data)
         return data
+
+
+def config_context_dimension_fields(fields):
+    """
+    Return ``{name: field}`` for the fields among *fields* that feed a config
+    context dimension: a non-polymorphic OBJECT field whose name and target model
+    both match ``CONFIG_CONTEXT_DIMENSION_FIELDS``.
+    """
+    dimension_fields = {}
+    for field in fields:
+        target = CONFIG_CONTEXT_DIMENSION_FIELDS.get(field.name)
+        if target is None or field.type != CustomFieldTypeChoices.TYPE_OBJECT or field.is_polymorphic:
+            continue
+        ct = field.related_object_type
+        if ct is not None and (ct.app_label, ct.model) == target:
+            dimension_fields[field.name] = field
+    return dimension_fields
+
+
+def _merged_source_context_data(source):
+    """Merge the data of every ConfigContext that applies to *source* (or ``{}``)."""
+    data = {}
+    if source is not None:
+        contexts = ConfigContext.objects.get_for_object(source, aggregate_data=True) or []
+        for context in contexts:
+            data = deepmerge(data, context)
+    return data
+
+
+class ConfigContextRenderer:
+    """
+    Render config context for many custom objects, sharing work between them.
+
+    Finding the source contexts for an object takes several queries.  Objects with
+    the same dimension objects and tags get the same source contexts, so their
+    merged data is computed once per distinct combination, and each type's
+    dimension fields are looked up once.  Use one renderer per request: it
+    remembers source data for its lifetime.
+    """
+
+    def __init__(self):
+        self._dimension_fields = {}
+        self._source_data = {}
+
+    def render(self, obj):
+        cot_id = obj.custom_object_type.pk
+        if cot_id not in self._dimension_fields:
+            self._dimension_fields[cot_id] = obj._config_context_dimension_fields()
+        source = obj._config_context_source(self._dimension_fields[cot_id])
+        if source is None:
+            return obj._render_config_context(None, source_data={})
+        key = (
+            tuple(getattr(getattr(source, name), "pk", None) for name in CONFIG_CONTEXT_DIMENSION_FIELDS),
+            tuple(source.tags.slugs()),
+        )
+        if key not in self._source_data:
+            self._source_data[key] = _merged_source_context_data(source)
+        return obj._render_config_context(source, source_data=self._source_data[key])
 
 
 def validate_pep440(value):
@@ -2117,7 +2184,8 @@ class CustomObjectType(NetBoxModel):
 
         attrs = {
             "Meta": meta,
-            "__module__": "database.models",
+            # Resolvable through this module's __getattr__, so the class can be pickled.
+            "__module__": __name__,
             "custom_object_type": self,
             "custom_object_type_id": self.id,
         }
@@ -2232,10 +2300,15 @@ class CustomObjectType(NetBoxModel):
                     type=CustomFieldTypeChoices.TYPE_MULTIOBJECT,
                     is_polymorphic=False,
                 ).iterator():
+                    # Patch only this branch context's classes; apps.all_models holds main's.
+                    through_model = CustomObjectType.get_cached_through_model(
+                        inbound_field.custom_object_type_id, inbound_field.through_model_name, branch_id
+                    )
+                    if through_model is None:
+                        continue
                     try:
-                        through_model = apps.get_model(APP_LABEL, inbound_field.through_model_name)
                         target_field = through_model._meta.get_field('target')
-                    except (LookupError, FieldDoesNotExist):
+                    except FieldDoesNotExist:
                         continue
                     target_field.remote_field.model = model
                     target_field.related_model = model
@@ -2247,6 +2320,23 @@ class CustomObjectType(NetBoxModel):
                     target_field.__dict__.pop('path_infos', None)
                     target_field.__dict__.pop('reverse_path_infos', None)
 
+                    # The owning COT's cached model holds the M2M field itself, which must
+                    # agree with the through model's target; otherwise Django can't build the
+                    # join and filtering on the field fails.
+                    owner_model = CustomObjectType.get_cached_model(inbound_field.custom_object_type_id, branch_id)
+                    if owner_model is None:
+                        continue
+                    m2m_field = next(
+                        (f for f in owner_model._meta.local_many_to_many if f.name == inbound_field.name),
+                        None,
+                    )
+                    if m2m_field is None:
+                        continue
+                    m2m_field.remote_field.model = model
+                    m2m_field.related_model = model
+                    m2m_field.__dict__.pop('path_infos', None)
+                    m2m_field.__dict__.pop('reverse_path_infos', None)
+
                 # Same staleness problem exists for direct FK fields (TYPE_OBJECT):
                 # when this COT is regenerated, any cached model for another COT that
                 # holds a LazyForeignKey pointing here still references the old class.
@@ -2256,7 +2346,7 @@ class CustomObjectType(NetBoxModel):
                     type=CustomFieldTypeChoices.TYPE_OBJECT,
                     is_polymorphic=False,
                 ).iterator():
-                    owner_model = CustomObjectType.get_cached_model(inbound_fk_field.custom_object_type_id)
+                    owner_model = CustomObjectType.get_cached_model(inbound_fk_field.custom_object_type_id, branch_id)
                     if owner_model is None:
                         continue
                     # Use local_fields list — avoids _relation_tree → get_models() recursion.
@@ -2884,7 +2974,9 @@ class CustomObjectTypeField(CloningMixin, ExportTemplatesMixin, ChangeLoggedMode
         verbose_name=_("dynamic assignment"),
         blank=True,
         null=True,
-        help_text=_("Filter definition used to dynamically resolve matching objects (for Dynamic Assignment fields only)."),
+        help_text=_(
+            "Filter definition used to dynamically resolve matching objects (for Dynamic Assignment fields only)."
+        ),
     )
     ui_visible = models.CharField(
         max_length=50,
@@ -4636,6 +4728,33 @@ def clear_cache_on_field_delete(sender, instance, **kwargs):
         CustomObjectType.clear_model_cache(instance.custom_object_type_id)
 
 
+def check_removed_choices(choice_set):
+    """
+    Reject removal of choices that are still used by custom objects.
+    """
+    original = {value for value, _label in choice_set._original_extra_choices or ()}
+    current = {value for value, _label in choice_set.extra_choices or ()}
+    if choice_set.base_choices:
+        current.update(value for value, _label in CHOICE_SETS.get(choice_set.base_choices))
+    if choice_set.pk is None or not (removed := original - current):
+        return
+
+    fields = CustomObjectTypeField.objects.filter(choice_set=choice_set).select_related('custom_object_type')
+    for field in fields:
+        model = field.custom_object_type.get_model()
+        for choice in sorted(removed):
+            if field.type == CustomFieldTypeChoices.TYPE_MULTISELECT:
+                lookup = {f'{field.name}__contains': [choice]}
+            else:
+                lookup = {field.name: choice}
+            if model.objects.filter(**lookup).exists():
+                raise ValidationError(
+                    _("Cannot remove choice {choice} as there are {model} objects which reference it.").format(
+                        choice=choice, model=field.custom_object_type.get_verbose_name()
+                    )
+                )
+
+
 @receiver(post_save, sender=CustomFieldChoiceSet)
 def clear_cache_on_choice_set_save(sender, instance, **kwargs):
     """
@@ -4652,3 +4771,22 @@ def clear_cache_on_choice_set_save(sender, instance, **kwargs):
         CustomObjectType.clear_model_cache(cot.id)
         cot.snapshot()
         cot.save(update_fields=['cache_timestamp'])
+
+
+def __getattr__(name):
+    """
+    Resolve generated model classes (``Table<id>Model``) by name, so pickle can find them.
+
+    They aren't stored on this module because they're rebuilt whenever their type changes;
+    ``get_model()`` returns the current class, for the active branch.
+    """
+    cot_id = extract_cot_id_from_model_name(name.lower())
+    if cot_id is not None and name == CustomObjectType.get_table_model_name(cot_id):
+        try:
+            return CustomObjectType.objects.get(pk=int(cot_id)).get_model()
+        except CustomObjectType.DoesNotExist:
+            pass
+        except (ProgrammingError, OperationalError):
+            # Unapplied migrations, or a real database failure: keep the traceback.
+            logger.warning("Could not resolve %s.%s", __name__, name, exc_info=True)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
